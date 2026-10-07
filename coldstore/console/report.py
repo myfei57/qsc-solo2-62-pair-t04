@@ -40,8 +40,8 @@ def text_report(rt: Runtime) -> str:
         ),
         f"compressor ids={rt.compressors.compressor_ids()} order={rt.compressors.order()}",
         (
-            f"rooms defrosting={telemetry.defrosting} warmups={telemetry.defrost_warmups} "
-            f"hottest={rt.rooms.hottest() or ''}"
+            f"rooms defrosting={telemetry.defrosting} records={telemetry.defrost_records} "
+            f"open={telemetry.defrost_open} hottest={rt.rooms.hottest() or ''}"
         ),
         (
             f"temp value={telemetry.temp_value:.4f} rate={telemetry.temp_rate:.4f} "

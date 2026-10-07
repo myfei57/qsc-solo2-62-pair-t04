@@ -471,17 +471,80 @@ def defrost_state(server: "Server", request: Request) -> Response:
     return json_response(server.runtime.defrost.state().as_dict())
 
 
+def defrost_sample(server: "Server", request: Request) -> Response:
+    room_id = request.str_field("id")
+    at = request.int_field("at") if "at" in request.payload else None
+    view = server.runtime.defrost.sample_frost(room_id, at)
+    return json_response(view.as_dict())
+
+
+def defrost_verdict(server: "Server", request: Request) -> Response:
+    room_id = request.str_field("id")
+    at = request.int_field("at") if "at" in request.payload else None
+    return json_response(server.runtime.defrost.trigger_verdict(room_id, at).as_dict())
+
+
+def defrost_due(server: "Server", request: Request) -> Response:
+    at = request.int_field("at") if "at" in request.payload else None
+    return json_response({"due": server.runtime.defrost.due_rooms(at)})
+
+
 def defrost_start(server: "Server", request: Request) -> Response:
     room_id = request.str_field("id")
+    force = bool(request.payload.get("force", False))
+    at = request.int_field("at") if "at" in request.payload else None
+    session = server.runtime.defrost.start(room_id, force=force, at=at)
     controller = server.runtime.defrost
-    controller.start(room_id)
-    return json_response({"started": room_id, "spilled": controller.spilled()})
+    return json_response(
+        {
+            "started": room_id,
+            "session_id": session.session_id,
+            "stage": session.stage,
+            "trigger": session.trigger,
+            "fans_running": server.runtime.cold_fans.running_ids(),
+            "records": len(controller.records()),
+        }
+    )
 
 
-def defrost_finish(server: "Server", request: Request) -> Response:
+def defrost_confirm(server: "Server", request: Request) -> Response:
+    at = request.int_field("at") if "at" in request.payload else None
+    session = server.runtime.defrost.confirm_fan_stopped(at)
+    return json_response({"session_id": session.session_id, "stage": session.stage})
+
+
+def defrost_heat(server: "Server", request: Request) -> Response:
+    at = request.int_field("at") if "at" in request.payload else None
+    session = server.runtime.defrost.begin_heating(at)
+    return json_response({"session_id": session.session_id, "stage": session.stage})
+
+
+def defrost_complete(server: "Server", request: Request) -> Response:
     room_id = request.str_field("id")
-    server.runtime.defrost.finish(room_id)
-    return json_response({"finished": room_id})
+    coil = request.float_field("coil_temp") if "coil_temp" in request.payload else None
+    force = bool(request.payload.get("force", False))
+    at = request.int_field("at") if "at" in request.payload else None
+    controller = server.runtime.defrost
+    if controller.active() is not None and controller.active().room_id != room_id:
+        raise ValueError("id does not match the active defrost session")
+    record = controller.complete(coil_temp=coil, at=at, force=force)
+    return json_response({"finished": record.room_id, "record": record.as_dict()})
+
+
+def defrost_abort(server: "Server", request: Request) -> Response:
+    reason = request.str_field("reason", "manual")
+    at = request.int_field("at") if "at" in request.payload else None
+    record = server.runtime.defrost.abort(reason=reason, at=at)
+    return json_response(
+        {
+            "aborted": record.room_id,
+            "session_id": record.session_id,
+            "stage": record.stage,
+            "reason": record.reason,
+            "fans_running": server.runtime.cold_fans.running_ids(),
+            "defrosting": server.runtime.defrost.defrosting(),
+        }
+    )
 
 
 def defrost_enqueue(server: "Server", request: Request) -> Response:
@@ -492,18 +555,66 @@ def defrost_enqueue(server: "Server", request: Request) -> Response:
 
 
 def defrost_replay(server: "Server", request: Request) -> Response:
-    return json_response({"replayed": server.runtime.defrost.replay()})
+    coil = request.float_field("coil_temp") if "coil_temp" in request.payload else None
+    at = request.int_field("at") if "at" in request.payload else None
+    controller = server.runtime.defrost
+    return json_response(
+        {"replayed": controller.replay(coil_temp=coil, at=at), "pending": controller.pending_count()}
+    )
 
 
 def defrost_recover(server: "Server", request: Request) -> Response:
     controller = server.runtime.defrost
     controller.recover()
-    return json_response({"recovered": True, "last_warmup": controller.last_warmup()})
+    return json_response({"recovered": True, "pending": controller.pending_count()})
+
+
+def defrost_recover_interrupted(server: "Server", request: Request) -> Response:
+    at = request.int_field("at") if "at" in request.payload else None
+    session_id = server.runtime.defrost.recover_interrupted(at)
+    return json_response({"rolled_back": session_id is not None, "session_id": session_id})
 
 
 def defrost_select(server: "Server", request: Request) -> Response:
     zone = request.int_field("zone")
     return json_response({"room": server.runtime.defrost.select(zone), "zone": zone})
+
+
+def defrost_trajectory(server: "Server", request: Request) -> Response:
+    room_id = request.query_str("id")
+    session_id = request.query_str("session_id")
+    payload = server.runtime.defrost.trajectory(
+        room_id=room_id or None, session_id=session_id or None
+    )
+    return json_response(payload)
+
+
+def defrost_config(server: "Server", request: Request) -> Response:
+    controller = server.runtime.defrost
+    if "finish_temp" in request.payload:
+        controller.set_finish_temp(request.float_field("finish_temp"))
+    if "max_duration" in request.payload:
+        controller.set_max_duration(request.int_field("max_duration"))
+    return json_response(
+        {"finish_temp": controller.finish_temp(), "max_duration": controller.max_duration()}
+    )
+
+
+def defrost_frost_config(server: "Server", request: Request) -> Response:
+    frost = server.runtime.defrost.frost
+    if "baseline" in request.payload:
+        frost.set_baseline(request.float_field("baseline"))
+    if "threshold" in request.payload:
+        frost.set_threshold(request.float_field("threshold"))
+    if "max_interval" in request.payload:
+        frost.set_max_interval(request.int_field("max_interval"))
+    return json_response(
+        {
+            "baseline": frost.baseline(),
+            "threshold": frost.threshold(),
+            "max_interval": frost.max_interval(),
+        }
+    )
 
 
 def ammonia_state(server: "Server", request: Request) -> Response:

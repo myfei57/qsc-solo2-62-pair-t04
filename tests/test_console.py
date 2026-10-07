@@ -23,8 +23,9 @@ class ConsoleCase(unittest.TestCase):
         self.store.close()
         self._tmp.cleanup()
 
-    def call(self, method: str, path: str, payload: dict | None = None):
-        response = self.server.dispatch(method, path, payload)
+    def call(self, method: str, path: str, payload: dict | None = None,
+             query: dict | None = None):
+        response = self.server.dispatch(method, path, payload, query)
         body = response.body.decode("utf-8")
         parsed = json.loads(body) if response.content_type.startswith("application/json") else body
         return response.status, parsed
@@ -259,29 +260,89 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(body["duty"], "e1")
 
     def test_defrost_routes(self) -> None:
-        self.add_room("r1", 1, -10.0)
-        self.add_room("r2", 2, -12.0)
+        self.add_room("r1", 1, -18.0)
+        self.add_room("r2", 2, -10.0)
         self.call("POST", "/fan/add", {"id": "f1", "role": "primary"})
         self.call("POST", "/fan/start", {"id": "f1"})
 
-        status, body = self.call("POST", "/defrost/start", {"id": "r1"})
-        self.assertEqual(body["started"], "r1")
-        self.assertFalse(body["spilled"])
+        # Trigger judgement first: fresh room is not due without force.
+        status, verdict = self.call("POST", "/defrost/verdict", {"id": "r1"})
+        self.assertFalse(verdict["trigger"])
+        status, error = self.call("POST", "/defrost/start", {"id": "r1"})
+        self.assertEqual(status, 400)
+
+        # Frost samples integrate temperature difference while the fan runs.
+        self.call("POST", "/defrost/frost-config", {"threshold": 500.0})
+        self.call("POST", "/defrost/sample", {"id": "r1", "at": 0})
+        status, sample = self.call("POST", "/defrost/sample", {"id": "r1", "at": 100})
+        self.assertGreater(sample["frost_load"], 500.0)
+        status, verdict = self.call("POST", "/defrost/verdict", {"id": "r1", "at": 100})
+        self.assertTrue(verdict["trigger"])
+        self.assertEqual(verdict["reason"], "frost_demand")
+
+        # Start stops the fans; heating is blocked until stopped is confirmed.
+        status, body = self.call("POST", "/defrost/start", {"id": "r1", "at": 100})
+        self.assertEqual(body["stage"], "fan_stopping")
+        self.assertEqual(body["fans_running"], [])
         status, body = self.call("GET", "/defrost")
         self.assertEqual(body["defrosting"], ["r1"])
-        self.assertEqual(body["warmups"], ["r1"])
+        self.assertTrue(body["chain_ok"])
+        self.assertEqual(body["queue"], [])
 
-        status, body = self.call("POST", "/defrost/finish", {"id": "r1"})
-        self.assertEqual(body["finished"], "r1")
+        status, body = self.call("POST", "/defrost/confirm-stopped", {"at": 101})
+        self.assertEqual(body["stage"], "fan_stopped")
+        status, body = self.call("POST", "/defrost/heat", {"at": 102})
+        self.assertEqual(body["stage"], "heating")
+        status, error = self.call(
+            "POST", "/defrost/complete", {"id": "r1", "coil_temp": 1.0, "at": 103}
+        )
+        self.assertEqual(status, 400)
+        status, body = self.call(
+            "POST", "/defrost/complete", {"id": "r1", "coil_temp": 6.0, "at": 103}
+        )
+        self.assertEqual(body["record"]["result"], "completed")
+
+        # The trajectory endpoint returns the full room history.
+        status, trajectory = self.call("GET", "/defrost/trajectory", query={"id": ["r1"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(trajectory["count"], 1)
+        self.assertTrue(trajectory["chain_ok"])
+        stages = [event["stage"] for event in trajectory["records"][0]["events"]]
+        self.assertEqual(stages[-1], "completed")
+
+        # Queue replay drives a room through the whole line idempotently.
         status, body = self.call("POST", "/defrost/enqueue", {"id": "r2"})
         self.assertEqual(body["pending"], 1)
-        status, body = self.call("POST", "/defrost/replay")
+        status, body = self.call("POST", "/defrost/replay", {"at": 200})
         self.assertEqual(body["replayed"], ["r2"])
+        status, body = self.call("POST", "/defrost/replay", {"at": 300})
+        self.assertEqual(body["replayed"], [])
         status, body = self.call("POST", "/defrost/select", {"zone": 2})
         self.assertEqual(body["room"], "r2")
-        status, body = self.call("POST", "/defrost/recover")
+
+        # Abort on a third session rolls the fan state back.
+        self.call("POST", "/defrost/start", {"id": "r1", "force": True, "at": 400})
+        self.call("POST", "/defrost/confirm-stopped", {"at": 401})
+        status, body = self.call("POST", "/defrost/abort", {"reason": "cancel", "at": 402})
+        self.assertEqual(body["stage"], "aborted")
+        self.assertEqual(body["fans_running"], ["f1"])
+        self.assertEqual(body["defrosting"], [])
+
+        status, body = self.call("POST", "/defrost/recover", {})
         self.assertTrue(body["recovered"])
-        self.assertEqual(body["last_warmup"], "r2")
+
+    def test_defrost_recovers_interrupted_session(self) -> None:
+        self.add_room("r1", 1, -18.0)
+        self.call("POST", "/fan/add", {"id": "f1", "role": "primary"})
+        self.call("POST", "/fan/start", {"id": "f1"})
+        self.call("POST", "/defrost/start", {"id": "r1", "force": True, "at": 0})
+        status, body = self.call("POST", "/defrost/recover-interrupted", {"at": 1})
+        self.assertTrue(body["rolled_back"])
+        status, trajectory = self.call("GET", "/defrost/trajectory", query={"id": ["r1"]})
+        self.assertEqual(trajectory["records"][0]["result"], "aborted")
+        self.assertEqual(trajectory["records"][0]["reason"], "interrupted")
+        status, body = self.call("POST", "/defrost/recover-interrupted", {})
+        self.assertFalse(body["rolled_back"])
 
     def test_ammonia_and_interlock_routes(self) -> None:
         status, body = self.call("GET", "/ammonia")

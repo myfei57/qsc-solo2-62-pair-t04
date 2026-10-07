@@ -109,6 +109,12 @@ class Request:
             return value
         return str(value)
 
+    def query_str(self, name: str, default: str = "") -> str:
+        values = self.query.get(name)
+        if not values:
+            return default
+        return values[-1]
+
 Handler = Callable[["Server", Request], Response]
 
 

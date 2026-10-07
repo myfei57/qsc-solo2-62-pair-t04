@@ -40,9 +40,16 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
                 rt.compressors.stage_down(comp_id)
             rt.supply.start_with_supply(rt.compressors, comp_id)
         if defrost and room_id:
-            rt.defrost.start(room_id)
-        elif room_id:
-            rt.defrost.finish(room_id)
+            active = rt.defrost.active()
+            if active is None:
+                rt.defrost.start(room_id, force=True)
+                rt.defrost.confirm_fan_stopped()
+                rt.defrost.begin_heating()
+            elif active.room_id == room_id:
+                rt.defrost.complete(force=True)
+        elif room_id and rt.defrost.active() is not None:
+            if rt.defrost.active().room_id == room_id:
+                rt.defrost.complete(force=True)
 
     quota_value = rt.accumulator.add(amount)
     rt.auditor.record("cycle", f"{temp:.4f}")

@@ -7,15 +7,23 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class DefrostState:
-    """Queued commands, warm up records and the rooms still defrosting."""
+    """Active session, pending queue and ledger summary for the console."""
 
-    commands: list[str]
-    warmups: list[str]
+    active: dict[str, object] | None
     defrosting: list[str]
+    queue: list[str]
+    records: int
+    sealed: int
+    chain_ok: bool
+    frost: dict[str, object]
 
     def as_dict(self) -> dict[str, object]:
         return {
-            "commands": self.commands,
-            "warmups": self.warmups,
+            "active": self.active,
             "defrosting": self.defrosting,
+            "queue": self.queue,
+            "records": self.records,
+            "sealed": self.sealed,
+            "chain_ok": self.chain_ok,
+            "frost": self.frost,
         }

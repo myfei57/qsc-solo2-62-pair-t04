@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 
@@ -10,7 +11,16 @@ from coldstore.ammonia import validate_threshold as validate_ammonia_threshold
 from coldstore.audit import Auditor
 from coldstore.comp import Bank as CompressorBank
 from coldstore.comp import validate_stage
-from coldstore.defrost import Controller as DefrostController
+from coldstore.defrost import (
+    ABORTED,
+    COMPLETED,
+    FAN_STOPPED,
+    FAN_STOPPING,
+    HEATING,
+    Controller as DefrostController,
+    FrostModel,
+)
+from coldstore.defrost.controller import DefrostFlowError, DefrostInProgress, DefrostNotDue
 from coldstore.evap import Condenser, validate_baseline as validate_evap_baseline
 from coldstore.fan import PRIMARY, STANDBY, FanSet
 from coldstore.interlock import Interlock
@@ -265,7 +275,179 @@ class CondenserCase(unittest.TestCase):
 
 
 class DefrostCase(unittest.TestCase):
-    def test_start_stops_fan_before_warmup(self) -> None:
+    def _build(self, tmp: str):
+        store = Store.open(f"{tmp}/state.json")
+        fans = FanSet()
+        fans.add_fan("f1", PRIMARY)
+        fans.add_fan("f2", STANDBY)
+        fans.start("f1")
+        rooms = RoomRegistry()
+        rooms.add_room("r1", 1, -18.0)
+        rooms.add_room("r2", 2, -10.0)
+        return store, fans, rooms, DefrostController(fans, rooms, store)
+
+    def test_trigger_uses_temperature_integral_not_bare_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, controller = self._build(tmp)
+            frost: FrostModel = controller.frost
+            frost.set_baseline(-25.0)
+            frost.set_threshold(1000.0)
+            # Same elapsed time, two rooms: the warmer (more frost driving)
+            # room integrates a bigger load over identical duration.
+            frost.sample("r1", at=0)
+            frost.sample("r1", at=100)
+            frost.sample("r2", at=0)
+            frost.sample("r2", at=100)
+            self.assertAlmostEqual(frost.frost_load("r1"), 700.0)
+            self.assertAlmostEqual(frost.frost_load("r2"), 1500.0)
+            verdict = controller.trigger_verdict("r2", at=100)
+            self.assertTrue(verdict.trigger)
+            self.assertEqual(verdict.reason, "frost_demand")
+            not_due = controller.trigger_verdict("r1", at=100)
+            self.assertFalse(not_due.trigger)
+            self.assertEqual(controller.due_rooms(at=100), ["r2"])
+
+    def test_max_interval_is_a_backstop_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, controller = self._build(tmp)
+            frost = controller.frost
+            frost.set_max_interval(3600)
+            frost.reset("r1", at=100)
+            self.assertFalse(controller.trigger_verdict("r1", at=3500).trigger)
+            verdict = controller.trigger_verdict("r1", at=3700)
+            self.assertTrue(verdict.trigger)
+            self.assertEqual(verdict.reason, "max_interval")
+
+    def test_start_below_threshold_rejected_without_force(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, controller = self._build(tmp)
+            controller.frost.set_threshold(1_000_000.0)
+            with self.assertRaises(DefrostNotDue):
+                controller.start("r1", at=0)
+            # Nothing moved: fan still running, no open session.
+            self.assertEqual(fans.running_ids(), ["f1"])
+            self.assertIsNone(controller.active())
+            session = controller.start("r1", force=True, at=0)
+            self.assertEqual(session.stage, FAN_STOPPING)
+
+    def test_heating_is_interlocked_until_fans_confirmed_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, controller = self._build(tmp)
+            controller.start("r1", force=True, at=0)
+            self.assertEqual(fans.running_ids(), [])
+            # Fan still observed running -> confirmation refused.
+            fans.start("f1")
+            with self.assertRaises(DefrostFlowError):
+                controller.confirm_fan_stopped(at=1)
+            with self.assertRaises(DefrostFlowError):
+                controller.begin_heating(at=1)
+            # Once stopped and confirmed, the gate opens, in strict order.
+            fans.stop("f1")
+            controller.confirm_fan_stopped(at=1)
+            self.assertEqual(controller.active().stage, FAN_STOPPED)
+            controller.begin_heating(at=2)
+            self.assertEqual(controller.active().stage, HEATING)
+
+    def test_full_flow_seals_immutable_record_and_restores_fan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, controller = self._build(tmp)
+            controller.set_finish_temp(5.0)
+            controller.start("r1", force=True, at=0)
+            controller.confirm_fan_stopped(at=1)
+            controller.begin_heating(at=2)
+            with self.assertRaises(DefrostFlowError):
+                controller.complete(coil_temp=2.0, at=3)
+            record = controller.complete(coil_temp=6.0, at=3)
+            self.assertEqual(record.stage, COMPLETED)
+            self.assertTrue(record.sealed)
+            self.assertEqual(record.reason, "target_temp")
+            self.assertEqual(fans.running_ids(), ["f1"])
+            self.assertEqual(controller.defrosting(), [])
+            self.assertIsNone(controller.active())
+            # Frost integral was reset on completion.
+            self.assertEqual(controller.frost.frost_load("r1"), 0.0)
+
+            stages = [event.stage for event in record.events]
+            self.assertEqual(stages[0], "manual")
+            self.assertIn(FAN_STOPPING, stages)
+            self.assertIn(FAN_STOPPED, stages)
+            self.assertIn(HEATING, stages)
+            self.assertEqual(stages[-1], COMPLETED)
+            # The record is append-only: no method edits an existing event.
+            self.assertIn("defrost stage=idle", controller.describe())
+
+    def test_max_duration_cuts_heating_off(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, controller = self._build(tmp)
+            controller.set_max_duration(100)
+            controller.start("r1", force=True, at=0)
+            controller.confirm_fan_stopped(at=1)
+            controller.begin_heating(at=2)
+            record = controller.complete(coil_temp=-2.0, at=102)
+            self.assertTrue(record.sealed)
+            self.assertEqual(record.reason, "max_duration")
+
+    def test_abort_rolls_back_to_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, controller = self._build(tmp)
+            # Accumulate real frost demand first; abort must not erase it.
+            controller.frost.sample("r1", at=0)
+            controller.frost.sample("r1", at=100)
+            demand = controller.frost.frost_load("r1")
+            # f1 running and r1 not defrosting at the checkpoint.
+            controller.start("r1", force=True, at=101)
+            controller.confirm_fan_stopped(at=102)
+            controller.begin_heating(at=103)
+            self.assertEqual(fans.running_ids(), [])
+            self.assertEqual(controller.defrosting(), ["r1"])
+            record = controller.abort(reason="operator cancel", at=104)
+            self.assertEqual(record.stage, ABORTED)
+            self.assertEqual(record.reason, "operator cancel")
+            # Physical plant returned to the pre-defrost stable state.
+            self.assertEqual(fans.running_ids(), ["f1"])
+            self.assertEqual(controller.defrosting(), [])
+            self.assertIsNone(controller.active())
+            # Frost load is retained: an aborted defrost must not zero demand.
+            self.assertEqual(controller.frost.frost_load("r1"), demand)
+            self.assertGreater(demand, 0.0)
+
+    def test_only_one_open_session_at_a_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, controller = self._build(tmp)
+            controller.start("r1", force=True, at=0)
+            with self.assertRaises(DefrostInProgress):
+                controller.start("r2", force=True, at=0)
+
+    def test_trajectory_per_room_and_chain_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, controller = self._build(tmp)
+            controller.start("r1", force=True, at=0)
+            controller.confirm_fan_stopped(at=1)
+            controller.begin_heating(at=2)
+            controller.complete(force=True, at=3)
+            controller.start("r2", force=True, at=10)
+            controller.abort(reason="cancel", at=11)
+
+            r1 = controller.trajectory(room_id="r1")
+            self.assertEqual(r1["count"], 1)
+            self.assertTrue(r1["chain_ok"])
+            self.assertEqual(r1["records"][0]["result"], COMPLETED)
+            r2 = controller.trajectory(room_id="r2")
+            self.assertEqual(r2["records"][0]["result"], ABORTED)
+
+            # Tamper with a historical ledger entry: the chain breaks.
+            raw = store.get("defrost:ledger")[0]
+            items = json.loads(raw)
+            first = json.loads(items[0])
+            first["detail"] = "999.0000"
+            items[0] = json.dumps(first)
+            store.put("defrost:ledger", json.dumps(items))
+            rebuilt = DefrostController(fans, rooms, store)
+            verdict = rebuilt.trajectory(room_id="r1")
+            self.assertFalse(verdict["chain_ok"])
+            self.assertEqual(verdict["broken_seq"], 0)
+
+    def test_queue_replays_idempotently_and_recovers_interruption(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = Store.open(f"{tmp}/state.json")
             fans = FanSet()
@@ -273,38 +455,54 @@ class DefrostCase(unittest.TestCase):
             fans.start("f1")
             rooms = RoomRegistry()
             rooms.add_room("r1", 1)
-            controller = DefrostController(fans, rooms, store)
-            controller.start("r1")
-            self.assertEqual(fans.running_ids(), [])
-            self.assertFalse(controller.spilled())
-            self.assertEqual(controller.warmups(), ["r1"])
-            self.assertEqual(controller.last_warmup(), "r1")
-            self.assertEqual(controller.defrosting(), ["r1"])
-            controller.finish("r1")
-            self.assertEqual(fans.running_ids(), ["f1"])
-            self.assertEqual(controller.defrosting(), [])
-            self.assertIn("defrost commands=0", controller.describe())
-
-    def test_queue_replay_and_selection(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            store = Store.open(f"{tmp}/state.json")
-            fans = FanSet()
-            fans.add_fan("f1", PRIMARY)
-            rooms = RoomRegistry()
-            rooms.add_room("r1", 1)
             rooms.add_room("r2", 2)
             controller = DefrostController(fans, rooms, store)
             controller.enqueue("r1")
+            controller.enqueue("r1")
             controller.enqueue("r2")
+            # Duplicate queue entries collapse to one pending command.
             self.assertEqual(controller.pending_count(), 2)
-            self.assertEqual(controller.replay(), ["r1", "r2"])
-            self.assertEqual(controller.warmup_count(), 2)
+            completed = controller.replay(at=1000)
+            self.assertEqual(completed, ["r1", "r2"])
+            self.assertEqual(controller.pending_count(), 0)
+            self.assertEqual(fans.running_ids(), ["f1"])
+            self.assertEqual(controller.defrosting(), [])
+            # Queue drained; a second replay changes nothing.
+            self.assertEqual(controller.replay(at=2000), [])
+            self.assertEqual(len(controller.records()), 2)
+
+            # Simulate a crash mid-defrost: reopen the store with a fresh
+            # controller, an unsealed active session must roll back.
+            controller.start("r1", force=True, at=3000)
+            reopened_store = Store.open(f"{tmp}/state.json")
+            fresh_fans = FanSet()
+            fresh_fans.add_fan("f1", PRIMARY)
+            rebuilt = DefrostController(fresh_fans, rooms, reopened_store)
+            session_id = rebuilt.recover_interrupted(at=3001)
+            self.assertIsNotNone(session_id)
+            self.assertIsNone(rebuilt.active())
+            record = rebuilt.ledger.record(session_id)
+            self.assertEqual(record.result, ABORTED)
+            self.assertEqual(record.reason, "interrupted")
+            self.assertEqual(rebuilt.command_list(), [])
+
+    def test_select_zone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, controller = self._build(tmp)
             self.assertEqual(controller.select(2), "r2")
             with self.assertRaises(ValueError):
                 controller.select(7)
-            controller.recover()
-            self.assertEqual(controller.command_list(), [])
-            self.assertEqual(controller.state().commands, [])
+
+    def test_frost_only_accumulates_while_fan_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, controller = self._build(tmp)
+            controller.frost.sample("r1", at=0)
+            fans.stop_all()
+            controller.frost.sample("r1", at=100)
+            self.assertEqual(controller.frost.frost_load("r1"), 0.0)
+            fans.start("f1")
+            controller.frost.sample("r1", at=200)
+            self.assertGreater(controller.frost.frost_load("r1"), 0.0)
 
 
 class AmmoniaCase(unittest.TestCase):

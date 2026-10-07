@@ -45,11 +45,17 @@ class Server:
             return error_response(500, str(exc))
 
     def dispatch(
-        self, method: str, path: str, payload: dict[str, object] | None = None
+        self, method: str, path: str, payload: dict[str, object] | None = None,
+        query: dict[str, list[str]] | None = None,
     ) -> Response:
         """Call a route directly, used by the test suite and CLI probes."""
 
-        request = Request(method=method.upper(), path=path, query={}, payload=dict(payload or {}))
+        request = Request(
+            method=method.upper(),
+            path=path,
+            query=dict(query or {}),
+            payload=dict(payload or {}),
+        )
         return self.respond(request)
 
     def __call__(
