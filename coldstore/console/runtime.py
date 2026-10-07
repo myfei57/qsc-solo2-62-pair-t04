@@ -8,6 +8,7 @@ from coldstore.comp import Bank
 from coldstore.defrost import Controller
 from coldstore.evap import Condenser
 from coldstore.fan import FanSet
+from coldstore.frost import FrostEstimator
 from coldstore.interlock import Interlock
 from coldstore.load import LoadCalculator
 from coldstore.quota import Accumulator
@@ -35,7 +36,8 @@ class Runtime:
         self.cold_fans = cold_fans
         self.evap_fans = evap_fans
         self.evap = Condenser(store, evap_fans)
-        self.defrost = Controller(cold_fans, rooms, store)
+        self.frost = FrostEstimator(store)
+        self.defrost = Controller(cold_fans, rooms, store, frost=self.frost)
         self.load = LoadCalculator(store)
         self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)

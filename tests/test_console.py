@@ -24,7 +24,18 @@ class ConsoleCase(unittest.TestCase):
         self._tmp.cleanup()
 
     def call(self, method: str, path: str, payload: dict | None = None):
-        response = self.server.dispatch(method, path, payload)
+        from urllib.parse import parse_qs, urlsplit
+
+        from coldstore.console.http import Request
+
+        parts = urlsplit(path)
+        request = Request(
+            method=method,
+            path=parts.path,
+            query=parse_qs(parts.query),
+            payload=dict(payload or {}),
+        )
+        response = self.server.respond(request)
         body = response.body.decode("utf-8")
         parsed = json.loads(body) if response.content_type.startswith("application/json") else body
         return response.status, parsed
@@ -44,7 +55,8 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             {check["name"] for check in checks["checks"]},
-            {"store", "interlock", "ammonia", "temp", "compressors", "fans", "evap", "rooms"},
+            {"store", "interlock", "ammonia", "temp", "compressors", "fans",
+             "evap", "rooms", "defrost"},
         )
 
         status, snapshot = self.call("GET", "/snapshot")
@@ -63,6 +75,7 @@ class ConsoleCase(unittest.TestCase):
                 "cold_fans",
                 "evap",
                 "defrost",
+                "frost",
                 "load",
                 "quota",
                 "audit",
@@ -264,24 +277,116 @@ class ConsoleCase(unittest.TestCase):
         self.call("POST", "/fan/add", {"id": "f1", "role": "primary"})
         self.call("POST", "/fan/start", {"id": "f1"})
 
+        # Starting without a trigger is refused; force opens the session.
         status, body = self.call("POST", "/defrost/start", {"id": "r1"})
+        self.assertEqual(status, 400)
+        status, body = self.call("POST", "/defrost/start", {"id": "r1", "force": 1})
+        self.assertEqual(status, 200)
         self.assertEqual(body["started"], "r1")
-        self.assertFalse(body["spilled"])
+        self.assertEqual(body["session"]["state"], "stopping_fans")
         status, body = self.call("GET", "/defrost")
         self.assertEqual(body["defrosting"], ["r1"])
+        self.assertEqual(body["active"][0]["state"], "stopping_fans")
+
+        # Heating is gated on the fan stop confirmation.
+        status, body = self.call("POST", "/defrost/heat", {"id": "r1"})
+        self.assertEqual(status, 400)
+        status, body = self.call("POST", "/defrost/confirm-fans", {"id": "r1"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["stop_confirmed_at"])
+        status, body = self.call("POST", "/defrost/heat", {"id": "r1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["state"], "heating")
+        status, body = self.call("GET", "/defrost")
         self.assertEqual(body["warmups"], ["r1"])
 
-        status, body = self.call("POST", "/defrost/finish", {"id": "r1"})
+        status, body = self.call("POST", "/defrost/heat-sample",
+                                 {"id": "r1", "temp": 10.0, "at": 5_000})
+        self.assertEqual(body["state"], "draining")
+
+        # Completing before the drain dwell is refused; then it finishes.
+        status, body = self.call("POST", "/defrost/finish", {"id": "r1", "at": 5_001})
+        self.assertEqual(status, 400)
+        status, body = self.call("POST", "/defrost/finish", {"id": "r1", "at": 5_300})
         self.assertEqual(body["finished"], "r1")
+        self.assertEqual(body["session"]["state"], "completed")
+
+        # Full trajectory is queryable by room.
+        status, body = self.call("GET", "/defrost/trajectory?id=r1")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["sessions"][0]["outcome"], "completed")
+        kinds = [event["kind"] for event in body["sessions"][0]["events"]]
+        self.assertEqual(kinds[0], "started")
+        self.assertEqual(kinds[-1], "completed")
+
+        # Queue replay is idempotent.
         status, body = self.call("POST", "/defrost/enqueue", {"id": "r2"})
         self.assertEqual(body["pending"], 1)
-        status, body = self.call("POST", "/defrost/replay")
-        self.assertEqual(body["replayed"], ["r2"])
+        status, first = self.call("POST", "/defrost/replay")
+        self.assertEqual(first["replayed"], ["r2"])
+        self.assertEqual(first["results"][0]["action"], "started")
+        status, second = self.call("POST", "/defrost/replay")
+        self.assertEqual(second["results"][0]["action"], "resumed")
         status, body = self.call("POST", "/defrost/select", {"zone": 2})
         self.assertEqual(body["room"], "r2")
+
+        # Abort rolls the in-flight r2 session back; recovery reports nothing left.
+        status, body = self.call("POST", "/defrost/abort", {"id": "r2"})
+        self.assertEqual(body["session"]["state"], "aborted")
         status, body = self.call("POST", "/defrost/recover")
         self.assertTrue(body["recovered"])
-        self.assertEqual(body["last_warmup"], "r2")
+        self.assertEqual(body["rolled_back"], [])
+
+        # Trigger verdict and config endpoints.
+        status, body = self.call("GET", "/defrost/trigger?id=r1")
+        self.assertEqual(status, 200)
+        self.assertIn("reason", body)
+        status, body = self.call("GET", "/defrost/config")
+        self.assertEqual(status, 200)
+        self.assertIn("end_temp", body)
+        status, body = self.call("POST", "/defrost/config", {"end_temp": 9.0})
+        self.assertEqual(body["end_temp"], 9.0)
+
+    def test_defrost_abort_rolls_back_fans(self) -> None:
+        self.add_room("r1", 1, -10.0)
+        self.call("POST", "/fan/add", {"id": "f1", "role": "primary"})
+        self.call("POST", "/fan/start", {"id": "f1"})
+        self.call("POST", "/defrost/start", {"id": "r1", "force": 1})
+        self.call("POST", "/defrost/confirm-fans", {"id": "r1"})
+        status, body = self.call("POST", "/defrost/abort", {"id": "r1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["session"]["state"], "aborted")
+        # Rollback restored the previously running fan.
+        status, fans = self.call("GET", "/fan")
+        self.assertEqual([f["id"] for f in fans["fans"] if f["running"]], ["f1"])
+        # Terminal record cannot be modified.
+        status, body = self.call("POST", "/defrost/heat", {"id": "r1"})
+        self.assertEqual(status, 400)
+
+    def test_frost_accumulation_routes(self) -> None:
+        self.add_room("r1", 1, -2.0)
+        self.call("POST", "/fan/add", {"id": "f1", "role": "primary"})
+        self.call("POST", "/fan/start", {"id": "f1"})
+        status, body = self.call("GET", "/frost?id=r1")
+        self.assertEqual(status, 200)
+        self.assertFalse(body["due"])
+
+        status, body = self.call(
+            "POST", "/frost/observe",
+            {"id": "r1", "room_temp": -2.0, "coil_temp": -12.0, "at": 100},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["frost_load"], 0.0)  # first sample anchors the clock
+        status, body = self.call(
+            "POST", "/frost/observe",
+            {"id": "r1", "room_temp": -2.0, "coil_temp": -12.0, "at": 200},
+        )
+        self.assertEqual(body["frost_load"], 1000.0)
+        status, body = self.call("GET", "/frost")
+        self.assertEqual(status, 200)
+        self.assertIn("verdicts", body)
+
 
     def test_ammonia_and_interlock_routes(self) -> None:
         status, body = self.call("GET", "/ammonia")

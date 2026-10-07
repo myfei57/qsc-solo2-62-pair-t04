@@ -265,46 +265,318 @@ class CondenserCase(unittest.TestCase):
 
 
 class DefrostCase(unittest.TestCase):
-    def test_start_stops_fan_before_warmup(self) -> None:
+    def _controller(self, tmp: str):
+        store = Store.open(f"{tmp}/state.json")
+        fans = FanSet()
+        fans.add_fan("f1", PRIMARY)
+        rooms = RoomRegistry()
+        rooms.add_room("r1", 1)
+        rooms.add_room("r2", 2)
+        clock = FakeClock()
+        from coldstore.frost import FrostEstimator
+        from coldstore.defrost import Controller
+
+        frost = FrostEstimator(store, clock=clock)
+        controller = Controller(fans, rooms, store, frost=frost, clock=clock)
+        return store, fans, rooms, frost, controller, clock
+
+    def _run_full_defrost(self, controller, room_id: str = "r1", end_temp: float = 10.0):
+        controller.start(room_id, force=True)
+        controller.confirm_fans_stopped(room_id)
+        controller.begin_heat(room_id)
+        controller.heat_sample(room_id, end_temp, at=controller._now() + 1)
+        controller.complete(room_id, at=controller._now() + 200)
+
+    def test_trigger_judgement_then_fan_then_heating(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = Store.open(f"{tmp}/state.json")
-            fans = FanSet()
-            fans.add_fan("f1", PRIMARY)
+            store, fans, rooms, frost, controller, clock = self._controller(tmp)
             fans.start("f1")
-            rooms = RoomRegistry()
-            rooms.add_room("r1", 1)
-            controller = DefrostController(fans, rooms, store)
-            controller.start("r1")
+
+            # Nothing due until the frost integral crosses the threshold.
+            verdict = controller.trigger("r1")
+            self.assertFalse(verdict.due)
+            with self.assertRaises(ValueError):
+                controller.start("r1")
+
+            # Integral grows only while the fan runs and gap is positive.
+            frost.observe("r1", room_temp=-2.0, coil_temp=-12.0,
+                          fan_running=True, at=100)
+            frost.observe("r1", room_temp=-2.0, coil_temp=-12.0,
+                          fan_running=True, at=200)
+            verdict = controller.trigger("r1")
+            self.assertTrue(verdict.due)
+            self.assertEqual(verdict.reason, "load")
+
+            opened = controller.start("r1")
+            self.assertEqual(opened["state"], "stopping_fans")
             self.assertEqual(fans.running_ids(), [])
-            self.assertFalse(controller.spilled())
+            self.assertEqual(controller.defrosting(), ["r1"])
+
+            # Heating is refused until the fan stop is confirmed.
+            with self.assertRaises(ValueError):
+                controller.begin_heat("r1")
+            confirmed = controller.confirm_fans_stopped("r1")
+            self.assertTrue(confirmed["stop_confirmed_at"])
+
+            controller.begin_heat("r1")
             self.assertEqual(controller.warmups(), ["r1"])
             self.assertEqual(controller.last_warmup(), "r1")
-            self.assertEqual(controller.defrosting(), ["r1"])
-            controller.finish("r1")
+            self.assertFalse(controller.spilled())
+
+            # A sample below end temp keeps heating; the reaching sample drains.
+            view = controller.heat_sample("r1", 2.0, at=clock.advance(10))
+            self.assertEqual(view["state"], "heating")
+            view = controller.heat_sample("r1", 10.0, at=clock.advance(10))
+            self.assertEqual(view["state"], "draining")
+            with self.assertRaises(ValueError):
+                controller.complete("r1", at=clock.now)
+            completed = controller.complete("r1", at=clock.advance(200))
+            self.assertEqual(completed["state"], "completed")
             self.assertEqual(fans.running_ids(), ["f1"])
             self.assertEqual(controller.defrosting(), [])
             self.assertIn("defrost commands=0", controller.describe())
+            # Completing zeroes the frost load for that room.
+            self.assertEqual(frost.load("r1"), 0.0)
 
-    def test_queue_replay_and_selection(self) -> None:
+    def test_fan_must_be_stopped_before_heating(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            store = Store.open(f"{tmp}/state.json")
-            fans = FanSet()
-            fans.add_fan("f1", PRIMARY)
-            rooms = RoomRegistry()
-            rooms.add_room("r1", 1)
-            rooms.add_room("r2", 2)
-            controller = DefrostController(fans, rooms, store)
+            store, fans, rooms, frost, controller, clock = self._controller(tmp)
+            fans.start("f1")
+            controller.start("r1", force=True)
+            fans.start("f1")  # fan spins back up before confirmation
+            with self.assertRaises(ValueError):
+                controller.confirm_fans_stopped("r1")
+            self.assertTrue(controller.spilled())
+            fans.stop("f1")
+            controller.confirm_fans_stopped("r1")
+            controller.begin_heat("r1")
+            controller.heat_sample("r1", 10.0, at=clock.advance(10))
+            controller.complete("r1", at=clock.advance(200))
+            self.assertEqual(fans.running_ids(), ["f1"])
+
+    def test_abort_rolls_back_to_last_stable_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, frost, controller, clock = self._controller(tmp)
+            fans.start("f1")
+            controller.start("r1", force=True)
+            controller.confirm_fans_stopped("r1")
+            controller.begin_heat("r1")
+            self.assertEqual(fans.running_ids(), [])
+
+            view = controller.abort("r1", reason="operator cancelled")
+            self.assertEqual(view["state"], "aborted")
+            self.assertEqual(fans.running_ids(), ["f1"])
+            self.assertEqual(controller.defrosting(), [])
+
+            # Terminal records are immutable.
+            with self.assertRaises(ValueError):
+                controller.begin_heat("r1")
+            trajectory = controller.trajectory("r1")
+            self.assertEqual(len(trajectory), 1)
+            self.assertEqual(trajectory[0]["outcome"], "aborted")
+            self.assertEqual(trajectory[0]["reason"], "operator cancelled")
+            self.assertEqual(
+                trajectory[0]["rollback_point"]["running_fans"], ["f1"]
+            )
+
+    def test_queue_replay_is_idempotent_and_selection_works(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, frost, controller, clock = self._controller(tmp)
             controller.enqueue("r1")
             controller.enqueue("r2")
+            controller.enqueue("r1")  # duplicate ignored
             self.assertEqual(controller.pending_count(), 2)
-            self.assertEqual(controller.replay(), ["r1", "r2"])
-            self.assertEqual(controller.warmup_count(), 2)
+
+            results = controller.replay()
+            self.assertEqual([item["room_id"] for item in results], ["r1", "r2"])
+            self.assertTrue(all(item["action"] == "started" for item in results))
+            self.assertEqual(controller.warmup_count(), 0)
+
+            # Replaying again resumes the in-flight sessions instead of duplicating.
+            again = controller.replay()
+            self.assertTrue(all(item["action"] == "resumed" for item in again))
             self.assertEqual(controller.select(2), "r2")
             with self.assertRaises(ValueError):
                 controller.select(7)
-            controller.recover()
+
+            result = controller.recover()
+            self.assertEqual(set(result["rolled_back"]), {"r1", "r2"})
             self.assertEqual(controller.command_list(), [])
             self.assertEqual(controller.state().commands, [])
+            self.assertEqual(controller.defrosting(), [])
+
+    def test_unknown_room_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, frost, controller, clock = self._controller(tmp)
+            with self.assertRaises(ValueError):
+                controller.start("nope", force=True)
+
+    def test_interval_trigger_is_the_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, frost, controller, clock = self._controller(tmp)
+            frost.set_max_interval(60)
+            frost.observe("r1", room_temp=-2.0, coil_temp=-2.0,
+                          fan_running=False, at=100)
+            verdict = frost.verdict("r1", at=110)
+            self.assertFalse(verdict.due)
+            verdict = frost.verdict("r1", at=200)
+            self.assertTrue(verdict.due)
+            self.assertEqual(verdict.reason, "interval")
+
+    def test_trajectory_lists_every_defrost_per_room(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, frost, controller, clock = self._controller(tmp)
+            self._run_full_defrost(controller, "r1", end_temp=10.0)
+            self._run_full_defrost(controller, "r1", end_temp=10.0)
+            trajectory = controller.trajectory("r1")
+            self.assertEqual(len(trajectory), 2)
+            self.assertTrue(all(item["state"] == "completed" for item in trajectory))
+            states = [event["kind"] for event in trajectory[0]["events"]]
+            self.assertEqual(
+                states,
+                ["started", "fan_stopped", "heat_began", "heat_sample",
+                 "drain_began", "completed"],
+            )
+
+    def test_state_survives_controller_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, frost, controller, clock = self._controller(tmp)
+            fans.start("f1")
+            controller.start("r1", force=True)
+            controller.confirm_fans_stopped("r1")
+
+            # A fresh controller over the same store resumes the same session.
+            rebuilt = DefrostController(fans, rooms, store, frost=frost, clock=clock)
+            self.assertEqual(rebuilt.defrosting(), ["r1"])
+            view = rebuilt.begin_heat("r1")
+            self.assertEqual(view["state"], "heating")
+            rebuilt.heat_sample("r1", 10.0, at=clock.advance(10))
+            rebuilt.complete("r1", at=clock.advance(200))
+            self.assertEqual(fans.running_ids(), ["f1"])
+            self.assertEqual(rebuilt.state().completed, 1)
+            self.assertEqual(rebuilt.state().sessions, 1)
+
+    def test_recover_on_restart_rolls_back_orphan_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, frost, controller, clock = self._controller(tmp)
+            fans.start("f1")
+            controller.start("r1", force=True)
+            controller.enqueue("r1")
+
+            rebuilt = DefrostController(fans, rooms, store, frost=frost, clock=clock)
+            result = rebuilt.recover()
+            self.assertEqual(result["rolled_back"], ["r1"])
+            self.assertEqual(fans.running_ids(), ["f1"])
+            self.assertEqual(rebuilt.command_list(), [])
+            self.assertEqual(rebuilt.defrosting(), [])
+            # The abort itself is a permanent, queryable record.
+            trajectory = rebuilt.trajectory("r1")
+            self.assertEqual(trajectory[0]["state"], "aborted")
+
+    def test_heating_timeout_aborts_and_restores_fans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, frost, controller, clock = self._controller(tmp)
+            controller.set_max_heat_seconds(60)
+            fans.start("f1")
+            controller.start("r1", force=True)
+            controller.confirm_fans_stopped("r1")
+            controller.begin_heat("r1")
+            with self.assertRaises(ValueError):
+                controller.heat_sample("r1", 0.0, at=clock.advance(120))
+            self.assertEqual(fans.running_ids(), ["f1"])
+            self.assertEqual(controller.defrosting(), [])
+            trajectory = controller.trajectory("r1")[-1]
+            self.assertEqual(trajectory["state"], "aborted")
+            self.assertIn("heating time", trajectory["reason"])
+
+    def test_config_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, fans, rooms, frost, controller, clock = self._controller(tmp)
+            with self.assertRaises(ValueError):
+                controller.set_end_temp(200)
+            with self.assertRaises(ValueError):
+                controller.set_drain_seconds(0)
+            with self.assertRaises(ValueError):
+                controller.set_max_heat_seconds(-1)
+
+
+class FakeClock:
+    def __init__(self, start: int = 1_000) -> None:
+        self.now = start
+
+    def __call__(self) -> int:
+        return self.now
+
+    def advance(self, seconds: int) -> int:
+        self.now += seconds
+        return self.now
+
+
+class FrostEstimatorCase(unittest.TestCase):
+    def _estimator(self, tmp: str):
+        from coldstore.frost import FrostEstimator
+
+        rooms = RoomRegistry()
+        rooms.add_room("r1", 1)
+        store = Store.open(f"{tmp}/state.json")
+        return FrostEstimator(store), rooms, store
+
+    def test_integral_only_accrues_with_fan_and_positive_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            frost, rooms, store = self._estimator(tmp)
+            # First sample anchors the clock, no elapsed time yet.
+            self.assertEqual(
+                frost.observe("r1", -2.0, -12.0, fan_running=True, at=100), 0.0
+            )
+            # Fan running, gap 10 over 60s -> 600 degree seconds.
+            self.assertEqual(
+                frost.observe("r1", -2.0, -12.0, fan_running=True, at=160), 600.0
+            )
+            # Fan stopped interval adds nothing.
+            self.assertEqual(
+                frost.observe("r1", -2.0, -12.0, fan_running=False, at=220), 600.0
+            )
+            # Coil warmer than the room (gap <= 0) adds nothing.
+            self.assertEqual(
+                frost.observe("r1", -12.0, -2.0, fan_running=True, at=280), 600.0
+            )
+
+    def test_load_trigger_precedes_interval_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            frost, rooms, store = self._estimator(tmp)
+            frost.set_threshold(100)
+            frost.set_max_interval(10_000)
+            frost.observe("r1", -2.0, -12.0, fan_running=True, at=0)
+            frost.observe("r1", -2.0, -12.0, fan_running=True, at=20)
+            verdict = frost.verdict("r1", at=20)
+            self.assertTrue(verdict.due)
+            self.assertEqual(verdict.reason, "load")
+
+    def test_completed_defrost_resets_load_and_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            frost, rooms, store = self._estimator(tmp)
+            frost.set_threshold(100)
+            frost.observe("r1", -2.0, -12.0, fan_running=True, at=0)
+            frost.observe("r1", -2.0, -12.0, fan_running=True, at=20)
+            self.assertTrue(frost.verdict("r1", at=20).due)
+            frost.commit_defrost("r1", at=20)
+            verdict = frost.verdict("r1", at=21)
+            self.assertFalse(verdict.due)
+            self.assertEqual(verdict.load, 0.0)
+            self.assertEqual(verdict.elapsed, 1)
+
+    def test_validation_and_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            frost, rooms, store = self._estimator(tmp)
+            from coldstore.frost import validate_interval, validate_threshold
+
+            with self.assertRaises(ValueError):
+                validate_threshold(0)
+            with self.assertRaises(ValueError):
+                validate_interval(-1)
+            self.assertGreater(frost.threshold(), 0)
+            self.assertGreater(frost.max_interval(), 0)
+            self.assertIn("frost threshold", frost.describe(rooms))
 
 
 class AmmoniaCase(unittest.TestCase):

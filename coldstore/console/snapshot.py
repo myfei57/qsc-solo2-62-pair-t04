@@ -23,6 +23,7 @@ def collect(rt: Runtime) -> dict[str, object]:
         "cold_fans": rt.cold_fans.state().as_dict(),
         "evap": rt.evap.state().as_dict(),
         "defrost": rt.defrost.state().as_dict(),
+        "frost": rt.frost.state(rt.rooms).as_dict(),
         "load": rt.load.state(rt.rooms).as_dict(),
         "quota": rt.accumulator.state().as_dict(),
         "audit": rt.auditor.state().as_dict(),

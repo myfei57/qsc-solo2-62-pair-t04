@@ -23,6 +23,7 @@ def collect(rt: Runtime) -> dict[str, str]:
         "cold_fans": rt.cold_fans.describe(),
         "evap": rt.evap.describe(),
         "defrost": rt.defrost.describe(),
+        "frost": rt.frost.describe(rt.rooms),
         "load": rt.load.describe(rt.rooms),
         "quota": rt.accumulator.describe(),
         "audit": rt.auditor.describe(),

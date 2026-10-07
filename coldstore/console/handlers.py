@@ -45,6 +45,15 @@ def _fan_set(server: "Server", request: Request):
     return server.runtime.cold_fans
 
 
+def _query_id(request: Request) -> str:
+    """Room identifier from a GET query string, falling back to the JSON body."""
+
+    values = request.query.get("id")
+    if values:
+        return values[0]
+    return request.str_field("id")
+
+
 def health(server: "Server", request: Request) -> Response:
     store = server.runtime.store
     return json_response(
@@ -214,7 +223,9 @@ def room_compressor(server: "Server", request: Request) -> Response:
 
 
 def room_reset(server: "Server", request: Request) -> Response:
-    server.runtime.rooms.reset_defrosting()
+    # The defrosting flags are projections of the durable ledger; reconcile
+    # them from it rather than clearing flags the ledger still considers live.
+    server.runtime.defrost.sync_room_flags()
     return json_response({"reset": True})
 
 
@@ -473,15 +484,49 @@ def defrost_state(server: "Server", request: Request) -> Response:
 
 def defrost_start(server: "Server", request: Request) -> Response:
     room_id = request.str_field("id")
+    force = request.str_field("force", "") not in ("", "0", "false", "False")
     controller = server.runtime.defrost
-    controller.start(room_id)
-    return json_response({"started": room_id, "spilled": controller.spilled()})
+    session = controller.start(room_id, force=force)
+    server.runtime.auditor.record(
+        "defrost", f"started {room_id} trigger={session['trigger']}"
+    )
+    return json_response({"started": room_id, "session": session})
+
+
+def defrost_confirm_fans(server: "Server", request: Request) -> Response:
+    room_id = request.str_field("id")
+    return json_response(server.runtime.defrost.confirm_fans_stopped(room_id))
+
+
+def defrost_heat_begin(server: "Server", request: Request) -> Response:
+    room_id = request.str_field("id")
+    return json_response(server.runtime.defrost.begin_heat(room_id))
+
+
+def defrost_heat_sample(server: "Server", request: Request) -> Response:
+    room_id = request.str_field("id")
+    temp = request.float_field("temp")
+    validate_temp(temp)
+    at_raw = request.payload.get("at")
+    at = _optional_int(at_raw)
+    return json_response(server.runtime.defrost.heat_sample(room_id, temp, at=at))
+
+
+def defrost_abort(server: "Server", request: Request) -> Response:
+    room_id = request.str_field("id")
+    reason = request.str_field("reason", "operator cancelled")
+    session = server.runtime.defrost.abort(room_id, reason=reason)
+    server.runtime.auditor.record("defrost", f"aborted {room_id} reason={reason}")
+    return json_response({"aborted": room_id, "session": session})
 
 
 def defrost_finish(server: "Server", request: Request) -> Response:
     room_id = request.str_field("id")
-    server.runtime.defrost.finish(room_id)
-    return json_response({"finished": room_id})
+    at_raw = request.payload.get("at")
+    at = _optional_int(at_raw)
+    session = server.runtime.defrost.finish(room_id, at=at)
+    server.runtime.auditor.record("defrost", f"completed {room_id}")
+    return json_response({"finished": room_id, "session": session})
 
 
 def defrost_enqueue(server: "Server", request: Request) -> Response:
@@ -492,18 +537,87 @@ def defrost_enqueue(server: "Server", request: Request) -> Response:
 
 
 def defrost_replay(server: "Server", request: Request) -> Response:
-    return json_response({"replayed": server.runtime.defrost.replay()})
+    results = server.runtime.defrost.replay()
+    return json_response({"replayed": [item["room_id"] for item in results], "results": results})
 
 
 def defrost_recover(server: "Server", request: Request) -> Response:
-    controller = server.runtime.defrost
-    controller.recover()
-    return json_response({"recovered": True, "last_warmup": controller.last_warmup()})
+    result = server.runtime.defrost.recover()
+    return json_response(result)
 
 
 def defrost_select(server: "Server", request: Request) -> Response:
     zone = request.int_field("zone")
     return json_response({"room": server.runtime.defrost.select(zone), "zone": zone})
+
+
+def defrost_trigger(server: "Server", request: Request) -> Response:
+    room_id = _query_id(request)
+    return json_response(server.runtime.defrost.trigger(room_id).as_dict())
+
+
+def defrost_trajectory(server: "Server", request: Request) -> Response:
+    room_id = _query_id(request)
+    sessions = server.runtime.defrost.trajectory(room_id)
+    return json_response({"room_id": room_id, "sessions": sessions, "count": len(sessions)})
+
+
+def defrost_config_get(server: "Server", request: Request) -> Response:
+    controller = server.runtime.defrost
+    return json_response(
+        {
+            "end_temp": controller.end_temp(),
+            "max_heat_seconds": controller.max_heat_seconds(),
+            "drain_seconds": controller.drain_seconds(),
+        }
+    )
+
+
+def defrost_config_set(server: "Server", request: Request) -> Response:
+    controller = server.runtime.defrost
+    updated: dict[str, float] = {}
+    if "end_temp" in request.payload:
+        updated["end_temp"] = controller.set_end_temp(request.float_field("end_temp"))
+    if "max_heat_seconds" in request.payload:
+        updated["max_heat_seconds"] = controller.set_max_heat_seconds(
+            request.float_field("max_heat_seconds")
+        )
+    if "drain_seconds" in request.payload:
+        updated["drain_seconds"] = controller.set_drain_seconds(
+            request.float_field("drain_seconds")
+        )
+    if not updated:
+        raise ValueError("no recognised config field supplied")
+    return json_response(updated)
+
+
+def frost_observe(server: "Server", request: Request) -> Response:
+    room_id = request.str_field("id")
+    room_temp = request.float_field("room_temp")
+    coil_temp = request.float_field("coil_temp")
+    validate_temp(room_temp)
+    at = _optional_int(request.payload.get("at"))
+    load = server.runtime.defrost.observe_frost(
+        room_id, room_temp, coil_temp, at=at
+    )
+    return json_response({"id": room_id, "frost_load": load})
+
+
+def frost_state(server: "Server", request: Request) -> Response:
+    room_id = _query_id(request)
+    frost = server.runtime.frost
+    if room_id:
+        return json_response(frost.verdict(room_id).as_dict())
+    return json_response(frost.state(server.runtime.rooms).as_dict())
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("field at must be an integer") from exc
 
 
 def ammonia_state(server: "Server", request: Request) -> Response:

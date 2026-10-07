@@ -56,4 +56,24 @@ def run_checks(rt: Runtime) -> list[dict[str, str]]:
     else:
         checks.append({"name": "rooms", "status": "ok", "detail": "every room assigned"})
 
+    active = rt.defrost.state().active
+    if active:
+        stuck = [
+            session["room_id"]
+            for session in active
+            if session["state"] == "stopping_fans" and rt.cold_fans.running_ids()
+        ]
+        if stuck:
+            checks.append(
+                {"name": "defrost", "status": "fail",
+                 "detail": "fan unconfirmed for " + ", ".join(stuck)}
+            )
+        else:
+            checks.append(
+                {"name": "defrost", "status": "ok",
+                 "detail": f"{len(active)} active session(s)"}
+            )
+    else:
+        checks.append({"name": "defrost", "status": "ok", "detail": "no active defrost"})
+
     return checks

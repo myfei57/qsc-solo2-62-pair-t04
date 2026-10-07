@@ -32,7 +32,8 @@ class Telemetry:
     cold_running: int
     evap_temperature: float
     evap_above: bool
-    defrost_warmups: int
+    defrost_completed: int
+    defrost_aborted: int
     cooling_load: float
     quota_value: float
     audit_entries: int
@@ -61,7 +62,8 @@ class Telemetry:
             "cold_running": self.cold_running,
             "evap_temperature": self.evap_temperature,
             "evap_above": self.evap_above,
-            "defrost_warmups": self.defrost_warmups,
+            "defrost_completed": self.defrost_completed,
+            "defrost_aborted": self.defrost_aborted,
             "cooling_load": self.cooling_load,
             "quota_value": self.quota_value,
             "audit_entries": self.audit_entries,
@@ -74,6 +76,7 @@ def collect(rt: Runtime) -> Telemetry:
 
     temp = rt.temp.state()
     compressor_state = rt.compressors.state()
+    defrost_state = rt.defrost.state()
     return Telemetry(
         store_keys=rt.store.count(),
         rooms=rt.rooms.count(),
@@ -96,7 +99,8 @@ def collect(rt: Runtime) -> Telemetry:
         cold_running=len(rt.cold_fans.running_ids()),
         evap_temperature=rt.evap.temperature(),
         evap_above=rt.evap.above_baseline(),
-        defrost_warmups=rt.defrost.warmup_count(),
+        defrost_completed=defrost_state.completed,
+        defrost_aborted=defrost_state.aborted,
         cooling_load=rt.load.total(rt.rooms),
         quota_value=rt.accumulator.value(),
         audit_entries=rt.auditor.count(),

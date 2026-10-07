@@ -40,8 +40,8 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
                 rt.compressors.stage_down(comp_id)
             rt.supply.start_with_supply(rt.compressors, comp_id)
         if defrost and room_id:
-            rt.defrost.start(room_id)
-        elif room_id:
+            rt.defrost.start(room_id, force=True)
+        elif defrost < 0 and room_id and rt.defrost.defrosting():
             rt.defrost.finish(room_id)
 
     quota_value = rt.accumulator.add(amount)
